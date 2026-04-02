@@ -26,7 +26,7 @@ This fork removes telemetry, replaces the Python bridge with a compiled Swift bi
 
 ### Improved
 - **Hook installer** — uses a shell launcher + compiled bridge (same pattern as Vibe Island). Auto-migrates from old Python hooks
-- **Terminal focus** — works without yabai. For iTerm2, selects the specific tab (not just the app) by matching the session TTY. Works with tmux (switches pane + tab). Uses `NSUserAppleScriptTask` — macOS will prompt for Automation permission on first use
+- **Terminal focus** — works without yabai. iTerm2: jumps to the exact tab. Tmux: switches to the correct pane. Requires Automation permission (macOS prompts on first use)
 
 ## Features
 
