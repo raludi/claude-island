@@ -75,7 +75,8 @@ struct ClaudeInstancesView: View {
                         onChat: { openChat(session) },
                         onArchive: { archiveSession(session) },
                         onApprove: { approveSession(session) },
-                        onReject: { rejectSession(session) }
+                        onReject: { rejectSession(session) },
+                        onToggleBypass: { sessionMonitor.toggleAutoApprove(sessionId: session.sessionId) }
                     )
                     .id(session.stableId)
                 }
@@ -88,15 +89,102 @@ struct ClaudeInstancesView: View {
     // MARK: - Actions
 
     private func focusSession(_ session: SessionState) {
-        guard session.isInTmux else { return }
-
         Task {
-            if let pid = session.pid {
-                _ = await YabaiController.shared.focusWindow(forClaudePid: pid)
-            } else {
-                _ = await YabaiController.shared.focusWindow(forWorkingDirectory: session.cwd)
+            // Try yabai first (if available and in tmux)
+            if session.isInTmux {
+                if let pid = session.pid {
+                    let success = await YabaiController.shared.focusWindow(forClaudePid: pid)
+                    if success { return }
+                }
+            }
+
+            guard let pid = session.pid else { return }
+
+            // Find the terminal app that owns this session's process
+            let terminalName = findTerminalAppName(forPid: pid)
+
+            if let name = terminalName {
+                activateApp(named: name)
             }
         }
+    }
+
+    /// Walk up the process tree from a PID to find the terminal application name
+    private func findTerminalAppName(forPid pid: Int) -> String? {
+        // Walk the direct parent chain first (works for non-tmux)
+        if let name = walkUpForTerminal(pid: pid) {
+            return name
+        }
+
+        // For tmux: find tmux client processes (PPID > 1) and walk up from them
+        let output = runProcess("/bin/ps", args: ["-eo", "pid,ppid,comm"])
+        for line in output.components(separatedBy: "\n") {
+            let parts = line.trimmingCharacters(in: .whitespaces)
+                .components(separatedBy: .whitespaces)
+                .filter { !$0.isEmpty }
+            guard parts.count >= 3,
+                  let tmuxPid = Int(parts[0]),
+                  let tmuxPpid = Int(parts[1]),
+                  tmuxPpid > 1 else { continue }
+            let comm = parts[2...].joined(separator: " ")
+            guard comm.lowercased().hasSuffix("tmux") || comm.lowercased().hasSuffix("tmux:") else { continue }
+            // Found a tmux client — walk up from its parent
+            if let name = walkUpForTerminal(pid: tmuxPpid) {
+                return name
+            }
+        }
+
+        return nil
+    }
+
+    /// Walk up from a PID checking each ancestor against known terminal apps
+    private func walkUpForTerminal(pid: Int) -> String? {
+        var current = pid
+        for _ in 0..<15 {
+            let info = runProcess("/bin/ps", args: ["-p", "\(current)", "-o", "ppid=,comm="])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !info.isEmpty else { return nil }
+
+            let parts = info.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+            guard parts.count >= 2, let ppid = Int(parts[0]) else { return nil }
+            let comm = parts[1...].joined(separator: " ")
+
+            // Check if this is a known terminal
+            let lower = comm.lowercased()
+            if lower.contains("iterm") { return "iTerm2" }
+            if lower.contains("terminal.app") || (lower.contains("terminal") && lower.contains("/applications/")) { return "Terminal" }
+            if lower.contains("ghostty") { return "Ghostty" }
+            if lower.contains("alacritty") { return "Alacritty" }
+            if lower.contains("kitty") { return "kitty" }
+            if lower.contains("warp") { return "Warp" }
+            if lower.contains("wezterm") { return "WezTerm" }
+
+            current = ppid
+            if current <= 1 { return nil }
+        }
+        return nil
+    }
+
+    private func activateApp(named name: String) {
+        let script = "tell application \"\(name)\" to activate"
+        if let appleScript = NSAppleScript(source: script) {
+            var error: NSDictionary?
+            appleScript.executeAndReturnError(&error)
+        }
+    }
+
+    private func runProcess(_ path: String, args: [String]) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch { return "" }
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     }
 
     private func openChat(_ session: SessionState) {
@@ -125,11 +213,10 @@ struct InstanceRow: View {
     let onArchive: () -> Void
     let onApprove: () -> Void
     let onReject: () -> Void
+    let onToggleBypass: () -> Void
 
     @State private var isHovered = false
     @State private var spinnerPhase = 0
-    @State private var isYabaiAvailable = false
-
     private let claudeOrange = Color(red: 0.85, green: 0.47, blue: 0.34)
     private let spinnerSymbols = ["·", "✢", "✳", "∗", "✻", "✽"]
     private let spinnerTimer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
@@ -157,6 +244,18 @@ struct InstanceRow: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.white)
                     .lineLimit(1)
+
+                // Bypass mode indicator
+                if session.autoApprove {
+                    HStack(spacing: 4) {
+                        Image(systemName: "bolt.shield.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(Color(red: 1.0, green: 0.3, blue: 0.3))
+                        Text("Bypass mode — auto-approving all tools")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color(red: 1.0, green: 0.3, blue: 0.3).opacity(0.8))
+                    }
+                }
 
                 // Show tool call when waiting for approval, otherwise last activity
                 if isWaitingForApproval, let toolName = session.pendingToolName {
@@ -226,6 +325,14 @@ struct InstanceRow: View {
 
             Spacer(minLength: 0)
 
+            // Context window remaining percentage
+            if let remaining = session.remainingPercentage {
+                Text("\(remaining)%")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(remaining > 50 ? .white.opacity(0.35) : (remaining > 20 ? TerminalColors.amber.opacity(0.7) : Color(red: 1.0, green: 0.3, blue: 0.3).opacity(0.8)))
+                    .padding(.trailing, 4)
+            }
+
             // Action icons or approval buttons
             if isWaitingForApproval && isInteractiveTool {
                 // Interactive tools like AskUserQuestion - show chat + terminal buttons
@@ -234,10 +341,10 @@ struct InstanceRow: View {
                         onChat()
                     }
 
-                    // Go to Terminal button (only if yabai available)
-                    if isYabaiAvailable {
+                    // Go to Terminal button
+                    if session.pid != nil {
                         TerminalButton(
-                            isEnabled: session.isInTmux,
+                            isEnabled: true,
                             onTap: { onFocus() }
                         )
                     }
@@ -252,16 +359,14 @@ struct InstanceRow: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
             } else {
                 HStack(spacing: 8) {
+                    // Bypass mode toggle
+                    BypassButton(isActive: session.autoApprove) {
+                        onToggleBypass()
+                    }
+
                     // Chat icon - always show
                     IconButton(icon: "bubble.left") {
                         onChat()
-                    }
-
-                    // Focus icon (only for tmux instances with yabai)
-                    if session.isInTmux && isYabaiAvailable {
-                        IconButton(icon: "eye") {
-                            onFocus()
-                        }
                     }
 
                     // Archive button - only for idle or completed sessions
@@ -281,15 +386,15 @@ struct InstanceRow: View {
         .onTapGesture(count: 2) {
             onChat()
         }
+        .onTapGesture(count: 1) {
+            onFocus()
+        }
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isWaitingForApproval)
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(isHovered ? Color.white.opacity(0.06) : Color.clear)
         )
         .onHover { isHovered = $0 }
-        .task {
-            isYabaiAvailable = await WindowFinder.shared.isYabaiAvailable()
-        }
     }
 
     @ViewBuilder
@@ -466,5 +571,34 @@ struct TerminalButton: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Bypass Mode Button
+
+struct BypassButton: View {
+    let isActive: Bool
+    let action: () -> Void
+
+    private let dangerRed = Color(red: 1.0, green: 0.3, blue: 0.3)
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button {
+            action()
+        } label: {
+            Image(systemName: isActive ? "bolt.shield.fill" : "bolt.shield")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isActive ? dangerRed : (isHovered ? .white.opacity(0.8) : .white.opacity(0.4)))
+                .frame(width: 24, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isActive ? dangerRed.opacity(0.15) : (isHovered ? Color.white.opacity(0.1) : Color.clear))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help(isActive ? "Bypass mode ON — auto-approving all tools" : "Enable bypass mode — auto-approve all tools")
     }
 }

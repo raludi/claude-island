@@ -8,7 +8,6 @@
 
 import Combine
 import Foundation
-import Mixpanel
 import os.log
 
 /// Central state manager for all Claude sessions
@@ -43,6 +42,21 @@ actor SessionStore {
     // MARK: - Initialization
 
     private init() {}
+
+    // MARK: - Auto-Approve (Bypass Mode)
+
+    /// Toggle auto-approve for a session
+    func toggleAutoApprove(sessionId: String) {
+        guard var session = sessions[sessionId] else { return }
+        session.autoApprove.toggle()
+        sessions[sessionId] = session
+        publishState()
+    }
+
+    /// Check if a session has auto-approve enabled
+    func isAutoApprove(sessionId: String) -> Bool {
+        sessions[sessionId]?.autoApprove ?? false
+    }
 
     // MARK: - Event Processing
 
@@ -120,11 +134,6 @@ actor SessionStore {
         let isNewSession = sessions[sessionId] == nil
         var session = sessions[sessionId] ?? createSession(from: event)
 
-        // Track new session in Mixpanel
-        if isNewSession {
-            Mixpanel.mainInstance().track(event: "Session Started")
-        }
-
         session.pid = event.pid
         if let pid = event.pid {
             let tree = ProcessTreeBuilder.shared.buildTree()
@@ -135,9 +144,20 @@ actor SessionStore {
         }
         session.lastActivity = Date()
 
+        // Update context window remaining percentage from StatusLine events
+        if let remaining = event.remainingPercentage {
+            session.remainingPercentage = remaining
+        }
+
         if event.status == "ended" {
             sessions.removeValue(forKey: sessionId)
             cancelPendingSync(sessionId: sessionId)
+            return
+        }
+
+        // StatusLine events only update the remaining percentage, not the phase
+        if event.event == "StatusLine" {
+            sessions[sessionId] = session
             return
         }
 

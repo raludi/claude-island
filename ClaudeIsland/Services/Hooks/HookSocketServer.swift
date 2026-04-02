@@ -25,6 +25,7 @@ struct HookEvent: Codable, Sendable {
     let toolUseId: String?
     let notificationType: String?
     let message: String?
+    let remainingPercentage: Int?
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
@@ -33,10 +34,11 @@ struct HookEvent: Codable, Sendable {
         case toolUseId = "tool_use_id"
         case notificationType = "notification_type"
         case message
+        case remainingPercentage = "remaining_percentage"
     }
 
     /// Create a copy with updated toolUseId
-    init(sessionId: String, cwd: String, event: String, status: String, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?) {
+    init(sessionId: String, cwd: String, event: String, status: String, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?, remainingPercentage: Int? = nil) {
         self.sessionId = sessionId
         self.cwd = cwd
         self.event = event
@@ -48,6 +50,7 @@ struct HookEvent: Codable, Sendable {
         self.toolUseId = toolUseId
         self.notificationType = notificationType
         self.message = message
+        self.remainingPercentage = remainingPercentage
     }
 
     var sessionPhase: SessionPhase {
@@ -447,7 +450,8 @@ class HookSocketServer {
                 toolInput: event.toolInput,
                 toolUseId: toolUseId,  // Use resolved toolUseId
                 notificationType: event.notificationType,
-                message: event.message
+                message: event.message,
+                remainingPercentage: event.remainingPercentage
             )
 
             let pending = PendingPermission(

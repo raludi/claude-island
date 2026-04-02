@@ -2,36 +2,88 @@
 //  HookInstaller.swift
 //  ClaudeIsland
 //
-//  Auto-installs Claude Code hooks on app launch
+//  Auto-installs Claude Code hooks on app launch.
+//  Uses a compiled Swift bridge binary instead of Python.
 //
 
 import Foundation
 
 struct HookInstaller {
 
-    /// Install hook script and update settings.json on app launch
+    /// Identifier string used in hook commands to detect our hooks
+    private static let hookIdentifier = "claude-island-bridge"
+
+    /// Install launcher script and update settings.json on app launch
     static func installIfNeeded() {
-        let claudeDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude")
-        let hooksDir = claudeDir.appendingPathComponent("hooks")
-        let pythonScript = hooksDir.appendingPathComponent("claude-island-state.py")
-        let settings = claudeDir.appendingPathComponent("settings.json")
-
-        try? FileManager.default.createDirectory(
-            at: hooksDir,
-            withIntermediateDirectories: true
-        )
-
-        if let bundled = Bundle.main.url(forResource: "claude-island-state", withExtension: "py") {
-            try? FileManager.default.removeItem(at: pythonScript)
-            try? FileManager.default.copyItem(at: bundled, to: pythonScript)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o755],
-                ofItemAtPath: pythonScript.path
-            )
-        }
-
+        installLauncher()
+        installStatusLine()
+        let settings = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/settings.json")
         updateSettings(at: settings)
+    }
+
+    /// Install the shell launcher at ~/.claude-island/bin/claude-island-bridge
+    private static func installLauncher() {
+        let fm = FileManager.default
+        let binDir = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-island/bin")
+
+        try? fm.createDirectory(at: binDir, withIntermediateDirectories: true)
+
+        let launcherPath = binDir.appendingPathComponent("claude-island-bridge")
+        let script = """
+        #!/bin/zsh
+        # claude-island-bridge launcher (auto-generated)
+        H=/Contents/Helpers/claude-island-bridge
+        B="/Applications/Claude Island.app${H}"
+        [ -x "$B" ] && exec "$B" "$@"
+        for P in "/Applications/Claude Island.app" "$HOME/Applications/Claude Island.app"; do
+          B="${P}${H}"; [ -x "$B" ] && exec "$B" "$@"
+        done
+        C=~/.claude-island/bin/.bridge-cache
+        [ -f "$C" ] && read -r P < "$C" && B="${P}${H}" && [ -x "$B" ] && exec "$B" "$@"
+        P="$(/usr/bin/mdfind 'kMDItemCFBundleIdentifier == "com.celestial.ClaudeIsland"' 2>/dev/null | /usr/bin/head -1)"
+        B="${P}${H}"
+        [ -x "$B" ] && { echo "$P" > "$C"; exec "$B" "$@"; }
+        exit 0
+        """
+
+        try? script.write(to: launcherPath, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: launcherPath.path)
+    }
+
+    /// Install the status line script at ~/.claude-island/bin/statusline.sh
+    private static func installStatusLine() {
+        let fm = FileManager.default
+        let binDir = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-island/bin")
+        let statusLinePath = binDir.appendingPathComponent("statusline.sh")
+
+        let script = """
+        #!/bin/bash
+        SOCKET="/tmp/claude-island.sock"
+        input=$(cat)
+        REMAINING=$(echo "$input" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d.get('context_window',{}).get('remaining_percentage',0)))" 2>/dev/null)
+        SESSION_ID=$(echo "$input" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id',''))" 2>/dev/null)
+        [ -z "$REMAINING" ] && REMAINING=0
+        [ -z "$SESSION_ID" ] && exit 0
+        MSG="{\\\"session_id\\\":\\\"${SESSION_ID}\\\",\\\"event\\\":\\\"StatusLine\\\",\\\"status\\\":\\\"status_update\\\",\\\"cwd\\\":\\\"\\\",\\\"remaining_percentage\\\":${REMAINING}}"
+        echo "$MSG" | /usr/bin/nc -U -w1 "$SOCKET" 2>/dev/null
+        echo "${REMAINING}% ctx"
+        """
+
+        try? script.write(to: statusLinePath, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: statusLinePath.path)
+    }
+
+    private static var statusLineCommand: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.claude-island/bin/statusline.sh"
+    }
+
+    private static var bridgeCommand: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.claude-island/bin/claude-island-bridge"
     }
 
     private static func updateSettings(at settingsURL: URL) {
@@ -41,8 +93,7 @@ struct HookInstaller {
             json = existing
         }
 
-        let python = detectPython()
-        let command = "\(python) ~/.claude/hooks/claude-island-state.py"
+        let command = bridgeCommand
         let hookEntry: [[String: Any]] = [["type": "command", "command": command]]
         let hookEntryWithTimeout: [[String: Any]] = [["type": "command", "command": command, "timeout": 86400]]
         let withMatcher: [[String: Any]] = [["matcher": "*", "hooks": hookEntry]]
@@ -70,7 +121,8 @@ struct HookInstaller {
 
         for (event, config) in hookEvents {
             if var existingEvent = hooks[event] as? [[String: Any]] {
-                let hasOurHook = existingEvent.contains { entry in
+                // Remove old Python-based hooks
+                existingEvent.removeAll { entry in
                     if let entryHooks = entry["hooks"] as? [[String: Any]] {
                         return entryHooks.contains { h in
                             let cmd = h["command"] as? String ?? ""
@@ -79,10 +131,20 @@ struct HookInstaller {
                     }
                     return false
                 }
+
+                let hasOurHook = existingEvent.contains { entry in
+                    if let entryHooks = entry["hooks"] as? [[String: Any]] {
+                        return entryHooks.contains { h in
+                            let cmd = h["command"] as? String ?? ""
+                            return cmd.contains(hookIdentifier)
+                        }
+                    }
+                    return false
+                }
                 if !hasOurHook {
                     existingEvent.append(contentsOf: config)
-                    hooks[event] = existingEvent
                 }
+                hooks[event] = existingEvent
             } else {
                 hooks[event] = config
             }
@@ -90,19 +152,24 @@ struct HookInstaller {
 
         json["hooks"] = hooks
 
+        // Register statusLine
+        json["statusLine"] = [
+            "command": statusLineCommand,
+            "type": "command"
+        ] as [String: Any]
+
         if let data = try? JSONSerialization.data(
             withJSONObject: json,
             options: [.prettyPrinted, .sortedKeys]
         ) {
-            try? data.write(to: settingsURL)
+            try? data.write(to: settingsURL, options: .atomic)
         }
     }
 
     /// Check if hooks are currently installed
     static func isInstalled() -> Bool {
-        let claudeDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude")
-        let settings = claudeDir.appendingPathComponent("settings.json")
+        let settings = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/settings.json")
 
         guard let data = try? Data(contentsOf: settings),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -116,7 +183,7 @@ struct HookInstaller {
                     if let entryHooks = entry["hooks"] as? [[String: Any]] {
                         for hook in entryHooks {
                             if let cmd = hook["command"] as? String,
-                               cmd.contains("claude-island-state.py") {
+                               cmd.contains(hookIdentifier) {
                                 return true
                             }
                         }
@@ -127,15 +194,16 @@ struct HookInstaller {
         return false
     }
 
-    /// Uninstall hooks from settings.json and remove script
+    /// Uninstall hooks from settings.json and remove launcher
     static func uninstall() {
-        let claudeDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude")
-        let hooksDir = claudeDir.appendingPathComponent("hooks")
-        let pythonScript = hooksDir.appendingPathComponent("claude-island-state.py")
-        let settings = claudeDir.appendingPathComponent("settings.json")
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let launcher = home.appendingPathComponent(".claude-island/bin/claude-island-bridge")
+        let oldPython = home.appendingPathComponent(".claude/hooks/claude-island-state.py")
+        let settings = home.appendingPathComponent(".claude/settings.json")
 
-        try? FileManager.default.removeItem(at: pythonScript)
+        try? fm.removeItem(at: launcher)
+        try? fm.removeItem(at: oldPython)
 
         guard let data = try? Data(contentsOf: settings),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -149,7 +217,7 @@ struct HookInstaller {
                     if let entryHooks = entry["hooks"] as? [[String: Any]] {
                         return entryHooks.contains { hook in
                             let cmd = hook["command"] as? String ?? ""
-                            return cmd.contains("claude-island-state.py")
+                            return cmd.contains(hookIdentifier) || cmd.contains("claude-island-state.py")
                         }
                     }
                     return false
@@ -173,25 +241,7 @@ struct HookInstaller {
             withJSONObject: json,
             options: [.prettyPrinted, .sortedKeys]
         ) {
-            try? data.write(to: settings)
+            try? data.write(to: settings, options: .atomic)
         }
-    }
-
-    private static func detectPython() -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        process.arguments = ["python3"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus == 0 {
-                return "python3"
-            }
-        } catch {}
-
-        return "python"
     }
 }

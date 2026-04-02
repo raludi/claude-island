@@ -35,6 +35,20 @@ class ClaudeSessionMonitor: ObservableObject {
             onEvent: { event in
                 Task {
                     await SessionStore.shared.process(.hookReceived(event))
+
+                    // Auto-approve if bypass mode is enabled for this session
+                    if event.expectsResponse {
+                        let isAutoApprove = await SessionStore.shared.isAutoApprove(sessionId: event.sessionId)
+                        if isAutoApprove, let toolUseId = event.toolUseId {
+                            HookSocketServer.shared.respondToPermission(
+                                toolUseId: toolUseId,
+                                decision: "allow"
+                            )
+                            await SessionStore.shared.process(
+                                .permissionApproved(sessionId: event.sessionId, toolUseId: toolUseId)
+                            )
+                        }
+                    }
                 }
 
                 if event.sessionPhase == .processing {
@@ -110,6 +124,13 @@ class ClaudeSessionMonitor: ObservableObject {
             await SessionStore.shared.process(
                 .permissionDenied(sessionId: sessionId, toolUseId: permission.toolUseId, reason: reason)
             )
+        }
+    }
+
+    /// Toggle auto-approve (bypass) mode for a session
+    func toggleAutoApprove(sessionId: String) {
+        Task {
+            await SessionStore.shared.toggleAutoApprove(sessionId: sessionId)
         }
     }
 

@@ -22,6 +22,8 @@ struct SessionState: Equatable, Identifiable, Sendable {
     var pid: Int?
     var tty: String?
     var isInTmux: Bool
+    var autoApprove: Bool
+    var remainingPercentage: Int?
 
     // MARK: - State Machine
 
@@ -71,6 +73,8 @@ struct SessionState: Equatable, Identifiable, Sendable {
         pid: Int? = nil,
         tty: String? = nil,
         isInTmux: Bool = false,
+        autoApprove: Bool = false,
+        remainingPercentage: Int? = nil,
         phase: SessionPhase = .idle,
         chatItems: [ChatHistoryItem] = [],
         toolTracker: ToolTracker = ToolTracker(),
@@ -89,6 +93,8 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.pid = pid
         self.tty = tty
         self.isInTmux = isInTmux
+        self.autoApprove = autoApprove
+        self.remainingPercentage = remainingPercentage
         self.phase = phase
         self.chatItems = chatItems
         self.toolTracker = toolTracker
