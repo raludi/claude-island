@@ -219,7 +219,8 @@ func main() {
         state["status"] = "waiting_for_input"
 
     case "SubagentStop":
-        state["status"] = "waiting_for_input"
+        // SubagentStop fires when a subagent completes - main session continues processing
+        state["status"] = "processing"
 
     case "SessionStart":
         state["status"] = "waiting_for_input"
