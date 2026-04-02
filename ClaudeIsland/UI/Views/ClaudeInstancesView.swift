@@ -134,7 +134,7 @@ struct ClaudeInstancesView: View {
                 .components(separatedBy: .whitespaces)
                 .filter { !$0.isEmpty }
             guard parts.count >= 3,
-                  let tmuxPid = Int(parts[0]),
+                  let _ = Int(parts[0]),
                   let tmuxPpid = Int(parts[1]),
                   tmuxPpid > 1 else { continue }
             let comm = parts[2...].joined(separator: " ")

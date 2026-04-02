@@ -29,6 +29,9 @@ actor SessionStore {
     /// Sync debounce interval (100ms)
     private let syncDebounceNs: UInt64 = 100_000_000
 
+    /// Debounced publish task — coalesces rapid state changes into one UI update per frame
+    private var publishTask: Task<Void, Never>?
+
     // MARK: - Published State (for UI)
 
     /// Publisher for session state changes (nonisolated for Combine subscription from any context)
@@ -182,7 +185,11 @@ actor SessionStore {
         }
 
         sessions[sessionId] = session
-        publishState()
+
+        // Permission requests need immediate UI response
+        if event.event == "PermissionRequest" {
+            publishStateNow()
+        }
 
         if event.shouldSyncFile {
             scheduleFileSync(sessionId: sessionId, cwd: event.cwd)
@@ -908,6 +915,16 @@ actor SessionStore {
         // Update conversationInfo (summary, lastMessage, etc.)
         session.conversationInfo = conversationInfo
 
+        // Infer phase from conversation state when loading history
+        // If Claude was the last to respond, the session is waiting for user input
+        if session.phase == .idle {
+            if let lastRole = conversationInfo.lastMessageRole,
+               lastRole == "assistant" || lastRole == "tool" {
+                session.phase = .waitingForInput
+                Self.logger.debug("History loaded: inferred phase .waitingForInput from lastMessageRole=\(lastRole, privacy: .public)")
+            }
+        }
+
         // Convert messages to chat items
         let existingIds = Set(session.chatItems.map { $0.id })
 
@@ -983,6 +1000,20 @@ actor SessionStore {
     // MARK: - State Publishing
 
     private func publishState() {
+        publishTask?.cancel()
+        publishTask = Task {
+            // Coalesce updates: wait ~16ms (one frame) before publishing
+            try? await Task.sleep(nanoseconds: 16_666_666)
+            guard !Task.isCancelled else { return }
+            let sortedSessions = Array(sessions.values).sorted { $0.projectName < $1.projectName }
+            sessionsSubject.send(sortedSessions)
+        }
+    }
+
+    /// Publish immediately for time-sensitive events (permissions, phase changes)
+    private func publishStateNow() {
+        publishTask?.cancel()
+        publishTask = nil
         let sortedSessions = Array(sessions.values).sorted { $0.projectName < $1.projectName }
         sessionsSubject.send(sortedSessions)
     }

@@ -883,7 +883,7 @@ actor ConversationParser {
 
     // MARK: - Subagent Tools Parsing
 
-    /// Parse subagent tools from an agent JSONL file
+    /// Parse subagent tools from an agent JSONL file (single-pass)
     func parseSubagentTools(agentId: String, cwd: String) -> [SubagentToolInfo] {
         guard !agentId.isEmpty else { return [] }
 
@@ -895,71 +895,7 @@ actor ConversationParser {
             return []
         }
 
-        var tools: [SubagentToolInfo] = []
-        var seenToolIds: Set<String> = []
-        var completedToolIds: Set<String> = []
-
-        for line in content.components(separatedBy: "\n") where !line.isEmpty {
-            if line.contains("\"tool_result\""),
-               let lineData = line.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-               let messageDict = json["message"] as? [String: Any],
-               let contentArray = messageDict["content"] as? [[String: Any]] {
-                for block in contentArray {
-                    if block["type"] as? String == "tool_result",
-                       let toolUseId = block["tool_use_id"] as? String {
-                        completedToolIds.insert(toolUseId)
-                    }
-                }
-            }
-        }
-
-        for line in content.components(separatedBy: "\n") where !line.isEmpty {
-            guard line.contains("\"tool_use\""),
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let messageDict = json["message"] as? [String: Any],
-                  let contentArray = messageDict["content"] as? [[String: Any]] else {
-                continue
-            }
-
-            for block in contentArray {
-                guard block["type"] as? String == "tool_use",
-                      let toolId = block["id"] as? String,
-                      let toolName = block["name"] as? String,
-                      !seenToolIds.contains(toolId) else {
-                    continue
-                }
-
-                seenToolIds.insert(toolId)
-
-                var input: [String: String] = [:]
-                if let inputDict = block["input"] as? [String: Any] {
-                    for (key, value) in inputDict {
-                        if let strValue = value as? String {
-                            input[key] = strValue
-                        } else if let intValue = value as? Int {
-                            input[key] = String(intValue)
-                        } else if let boolValue = value as? Bool {
-                            input[key] = boolValue ? "true" : "false"
-                        }
-                    }
-                }
-
-                let isCompleted = completedToolIds.contains(toolId)
-                let timestamp = json["timestamp"] as? String
-
-                tools.append(SubagentToolInfo(
-                    id: toolId,
-                    name: toolName,
-                    input: input,
-                    isCompleted: isCompleted,
-                    timestamp: timestamp
-                ))
-            }
-        }
-
-        return tools
+        return Self.parseSubagentToolsSinglePass(content: content)
     }
 }
 
@@ -987,27 +923,18 @@ extension ConversationParser {
             return []
         }
 
-        var tools: [SubagentToolInfo] = []
+        return parseSubagentToolsSinglePass(content: content)
+    }
+
+    /// Single-pass parser for subagent tools — collects tool_use and tool_result in one iteration
+    nonisolated private static func parseSubagentToolsSinglePass(content: String) -> [SubagentToolInfo] {
+        var pendingTools: [(id: String, name: String, input: [String: String], timestamp: String?)] = []
         var seenToolIds: Set<String> = []
         var completedToolIds: Set<String> = []
 
         for line in content.components(separatedBy: "\n") where !line.isEmpty {
-            if line.contains("\"tool_result\""),
-               let lineData = line.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-               let messageDict = json["message"] as? [String: Any],
-               let contentArray = messageDict["content"] as? [[String: Any]] {
-                for block in contentArray {
-                    if block["type"] as? String == "tool_result",
-                       let toolUseId = block["tool_use_id"] as? String {
-                        completedToolIds.insert(toolUseId)
-                    }
-                }
-            }
-        }
-
-        for line in content.components(separatedBy: "\n") where !line.isEmpty {
-            guard line.contains("\"tool_use\""),
+            // Skip lines that can't contain tool data (fast string check before JSON parsing)
+            guard line.contains("\"tool_"),
                   let lineData = line.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   let messageDict = json["message"] as? [String: Any],
@@ -1016,42 +943,44 @@ extension ConversationParser {
             }
 
             for block in contentArray {
-                guard block["type"] as? String == "tool_use",
-                      let toolId = block["id"] as? String,
-                      let toolName = block["name"] as? String,
-                      !seenToolIds.contains(toolId) else {
-                    continue
-                }
+                let blockType = block["type"] as? String
 
-                seenToolIds.insert(toolId)
+                if blockType == "tool_result",
+                   let toolUseId = block["tool_use_id"] as? String {
+                    completedToolIds.insert(toolUseId)
+                } else if blockType == "tool_use",
+                          let toolId = block["id"] as? String,
+                          let toolName = block["name"] as? String,
+                          !seenToolIds.contains(toolId) {
+                    seenToolIds.insert(toolId)
 
-                var input: [String: String] = [:]
-                if let inputDict = block["input"] as? [String: Any] {
-                    for (key, value) in inputDict {
-                        if let strValue = value as? String {
-                            input[key] = strValue
-                        } else if let intValue = value as? Int {
-                            input[key] = String(intValue)
-                        } else if let boolValue = value as? Bool {
-                            input[key] = boolValue ? "true" : "false"
+                    var input: [String: String] = [:]
+                    if let inputDict = block["input"] as? [String: Any] {
+                        for (key, value) in inputDict {
+                            if let strValue = value as? String {
+                                input[key] = strValue
+                            } else if let intValue = value as? Int {
+                                input[key] = String(intValue)
+                            } else if let boolValue = value as? Bool {
+                                input[key] = boolValue ? "true" : "false"
+                            }
                         }
                     }
+
+                    pendingTools.append((id: toolId, name: toolName, input: input, timestamp: json["timestamp"] as? String))
                 }
-
-                let isCompleted = completedToolIds.contains(toolId)
-                let timestamp = json["timestamp"] as? String
-
-                tools.append(SubagentToolInfo(
-                    id: toolId,
-                    name: toolName,
-                    input: input,
-                    isCompleted: isCompleted,
-                    timestamp: timestamp
-                ))
             }
         }
 
-        return tools
+        return pendingTools.map { tool in
+            SubagentToolInfo(
+                id: tool.id,
+                name: tool.name,
+                input: tool.input,
+                isCompleted: completedToolIds.contains(tool.id),
+                timestamp: tool.timestamp
+            )
+        }
     }
 }
 

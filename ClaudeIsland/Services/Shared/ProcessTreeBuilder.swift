@@ -26,10 +26,24 @@ struct ProcessInfo: Sendable {
 struct ProcessTreeBuilder: Sendable {
     nonisolated static let shared = ProcessTreeBuilder()
 
+    /// Cached process tree with TTL to avoid repeated ps spawning
+    private nonisolated(unsafe) static var cachedTree: [Int: ProcessInfo] = [:]
+    private nonisolated(unsafe) static var cacheExpiry: Date = .distantPast
+    private nonisolated(unsafe) static let cacheLock = NSLock()
+    private nonisolated(unsafe) static let cacheTTL: TimeInterval = 2.0
+
     private nonisolated init() {}
 
-    /// Build a process tree mapping PID -> ProcessInfo
+    /// Build a process tree mapping PID -> ProcessInfo (cached for 2 seconds)
     nonisolated func buildTree() -> [Int: ProcessInfo] {
+        Self.cacheLock.lock()
+        if Date() < Self.cacheExpiry {
+            let tree = Self.cachedTree
+            Self.cacheLock.unlock()
+            return tree
+        }
+        Self.cacheLock.unlock()
+
         guard let output = ProcessExecutor.shared.runSyncOrNil("/bin/ps", arguments: ["-eo", "pid,ppid,tty,comm"]) else {
             return [:]
         }
@@ -50,6 +64,11 @@ struct ProcessTreeBuilder: Sendable {
 
             tree[pid] = ProcessInfo(pid: pid, ppid: ppid, command: command, tty: tty)
         }
+
+        Self.cacheLock.lock()
+        Self.cachedTree = tree
+        Self.cacheExpiry = Date().addingTimeInterval(Self.cacheTTL)
+        Self.cacheLock.unlock()
 
         return tree
     }

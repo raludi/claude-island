@@ -32,6 +32,9 @@ class AgentFileWatcher {
     /// Track seen tool IDs to avoid duplicates
     private var seenToolIds: Set<String> = []
 
+    /// Debounce timer for file change events
+    private var parseDebounceItem: DispatchWorkItem?
+
     weak var delegate: AgentFileWatcherDelegate?
 
     init(sessionId: String, taskToolId: String, agentId: String, cwd: String) {
@@ -80,7 +83,7 @@ class AgentFileWatcher {
         )
 
         newSource.setEventHandler { [weak self] in
-            self?.parseTools()
+            self?.scheduleParseTools()
         }
 
         newSource.setCancelHandler { [weak self] in
@@ -92,6 +95,16 @@ class AgentFileWatcher {
         newSource.resume()
 
         logger.debug("Started watching agent file: \(self.agentId.prefix(8), privacy: .public) for task: \(self.taskToolId.prefix(12), privacy: .public)")
+    }
+
+    /// Debounce file change events to avoid parsing on every write (100ms)
+    private func scheduleParseTools() {
+        parseDebounceItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.parseTools()
+        }
+        parseDebounceItem = item
+        queue.asyncAfter(deadline: .now() + 0.1, execute: item)
     }
 
     private func parseTools() {

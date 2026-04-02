@@ -123,7 +123,7 @@ class NotchViewModel: ObservableObject {
 
     private func setupEventHandlers() {
         events.mouseLocation
-            .throttle(for: .milliseconds(50), scheduler: DispatchQueue.main, latest: true)
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] location in
                 self?.handleMouseMove(location)
             }

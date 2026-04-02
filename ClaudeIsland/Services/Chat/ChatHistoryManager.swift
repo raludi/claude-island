@@ -74,16 +74,23 @@ class ChatHistoryManager: ObservableObject {
     // MARK: - State Updates
 
     private func updateFromSessions(_ sessions: [SessionState]) {
-        var newHistories: [String: [ChatHistoryItem]] = [:]
-        var newAgentDescriptions: [String: [String: String]] = [:]
+        // Track which session IDs are still active
+        let activeIds = Set(sessions.map { $0.sessionId })
+
+        // Update only sessions that exist; remove stale ones
         for session in sessions {
             let filteredItems = filterOutSubagentTools(session.chatItems)
-            newHistories[session.sessionId] = filteredItems
-            newAgentDescriptions[session.sessionId] = session.subagentState.agentDescriptions
+            histories[session.sessionId] = filteredItems
+            agentDescriptions[session.sessionId] = session.subagentState.agentDescriptions
             loadedSessions.insert(session.sessionId)
         }
-        histories = newHistories
-        agentDescriptions = newAgentDescriptions
+
+        // Remove sessions that no longer exist
+        for key in histories.keys where !activeIds.contains(key) {
+            histories.removeValue(forKey: key)
+            agentDescriptions.removeValue(forKey: key)
+            loadedSessions.remove(key)
+        }
     }
 
     private func filterOutSubagentTools(_ items: [ChatHistoryItem]) -> [ChatHistoryItem] {
