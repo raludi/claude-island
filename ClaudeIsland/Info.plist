@@ -16,5 +16,7 @@
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright 2025. All rights reserved.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Claude Island needs to control terminal apps to switch to the correct tab when you click a session.</string>
 </dict>
 </plist>

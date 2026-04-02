@@ -104,6 +104,17 @@ struct ClaudeInstancesView: View {
             let terminalName = findTerminalAppName(forPid: pid)
 
             if let name = terminalName {
+                // For iTerm2: select the specific tab by TTY
+                if name == "iTerm2" {
+                    let tty = resolveDevTty(forPid: pid, isInTmux: session.isInTmux)
+                    if let tty = tty {
+                        if session.isInTmux {
+                            switchTmuxPane(forClaudePid: pid)
+                        }
+                        activateITermTab(tty: tty)
+                        return
+                    }
+                }
                 activateApp(named: name)
             }
         }
@@ -165,12 +176,166 @@ struct ClaudeInstancesView: View {
         return nil
     }
 
+    /// Find the tmux executable path (mirrors TmuxPathFinder logic)
+    private func findTmuxPath() -> String? {
+        for path in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux", "/bin/tmux"] {
+            if FileManager.default.isExecutableFile(atPath: path) { return path }
+        }
+        return nil
+    }
+
+    /// Resolve the /dev/tty that iTerm2 owns for this session.
+    /// For non-tmux: the Claude process's own TTY.
+    /// For tmux: the tmux client's TTY (which is the iTerm2 session's TTY).
+    private func resolveDevTty(forPid pid: Int, isInTmux: Bool) -> String? {
+        if isInTmux {
+            guard let tmux = findTmuxPath() else { return nil }
+            // Find the tmux client TTY — that's the iTerm2 session's TTY
+            let output = runProcess(tmux, args: ["list-clients", "-F", "#{client_tty}"])
+            let clientTtys = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                .components(separatedBy: "\n")
+                .filter { !$0.isEmpty }
+            // If there's only one client, use it directly
+            if clientTtys.count == 1 {
+                return clientTtys[0]
+            }
+            // Multiple clients: find which one hosts our pane's session
+            // Get the tmux session for our Claude PID
+            let panesOutput = runProcess(tmux, args: [
+                "list-panes", "-a", "-F", "#{pane_pid} #{session_name}"
+            ])
+            var tmuxSessionName: String?
+            for line in panesOutput.components(separatedBy: "\n") {
+                let parts = line.trimmingCharacters(in: .whitespaces)
+                    .components(separatedBy: " ")
+                guard parts.count >= 2 else { continue }
+                // Check if this pane's process tree contains our Claude PID
+                if let panePid = Int(parts[0]), isDescendant(pid: pid, of: panePid) {
+                    tmuxSessionName = parts[1]
+                    break
+                }
+            }
+            if let sessionName = tmuxSessionName {
+                let clientsOutput = runProcess(tmux, args: [
+                    "list-clients", "-F", "#{client_tty} #{client_session}"
+                ])
+                for line in clientsOutput.components(separatedBy: "\n") {
+                    let parts = line.trimmingCharacters(in: .whitespaces)
+                        .components(separatedBy: " ")
+                    if parts.count >= 2 && parts[1] == sessionName {
+                        return parts[0]
+                    }
+                }
+            }
+            return clientTtys.first
+        } else {
+            // Non-tmux: get the Claude process's TTY directly
+            let output = runProcess("/bin/ps", args: ["-p", "\(pid)", "-o", "tty="])
+            let tty = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tty.isEmpty && tty != "??" {
+                return "/dev/" + tty
+            }
+            return nil
+        }
+    }
+
+    /// Check if pid is a descendant of ancestorPid
+    private func isDescendant(pid: Int, of ancestorPid: Int) -> Bool {
+        var current = pid
+        for _ in 0..<20 {
+            if current == ancestorPid { return true }
+            let info = runProcess("/bin/ps", args: ["-p", "\(current)", "-o", "ppid="])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let ppid = Int(info), ppid > 1 else { return false }
+            current = ppid
+        }
+        return false
+    }
+
+    /// Switch tmux to the pane containing the Claude process
+    private func switchTmuxPane(forClaudePid pid: Int) {
+        guard let tmux = findTmuxPath() else { return }
+        let panesOutput = runProcess(tmux, args: [
+            "list-panes", "-a", "-F", "#{pane_pid} #{session_name}:#{window_index}.#{pane_index}"
+        ])
+        for line in panesOutput.components(separatedBy: "\n") {
+            let parts = line.trimmingCharacters(in: .whitespaces)
+                .components(separatedBy: " ")
+            guard parts.count >= 2, let panePid = Int(parts[0]) else { continue }
+            if isDescendant(pid: pid, of: panePid) {
+                let target = parts[1]
+                // Parse session:window.pane
+                let windowTarget = target.components(separatedBy: ".").first ?? target
+                _ = runProcess(tmux, args: ["select-window", "-t", windowTarget])
+                _ = runProcess(tmux, args: ["select-pane", "-t", target])
+                return
+            }
+        }
+    }
+
+    /// Directory for NSUserAppleScriptTask scripts
+    private var appScriptsDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Scripts/com.celestial.ClaudeIsland")
+    }
+
+    /// Run an AppleScript asynchronously via NSUserAppleScriptTask.
+    /// Compiles the source to a .scpt file in the app's scripts directory,
+    /// then executes it out-of-process so permission dialogs don't freeze the UI.
+    private func runUserAppleScript(named name: String, source: String) {
+        let scriptsDir = appScriptsDir
+        let scriptURL = scriptsDir.appendingPathComponent("\(name).scpt")
+
+        // Ensure scripts directory exists
+        try? FileManager.default.createDirectory(at: scriptsDir, withIntermediateDirectories: true)
+
+        // Write source to temp file and compile with osacompile
+        let sourceURL = scriptsDir.appendingPathComponent("\(name).applescript")
+        try? source.write(to: sourceURL, atomically: true, encoding: .utf8)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osacompile")
+        proc.arguments = ["-o", scriptURL.path, sourceURL.path]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        proc.waitUntilExit()
+
+        // Clean up source file
+        try? FileManager.default.removeItem(at: sourceURL)
+
+        // Execute via NSUserAppleScriptTask (async, out-of-process)
+        do {
+            let task = try NSUserAppleScriptTask(url: scriptURL)
+            task.execute(completionHandler: nil)
+        } catch {}
+    }
+
+    /// Activate the specific iTerm2 tab containing the given TTY.
+    private func activateITermTab(tty: String) {
+        let script = """
+        tell application "iTerm2"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    repeat with s in sessions of t
+                        if (tty of s) is "\(tty)" then
+                            select t
+                            tell w to select
+                            activate
+                            return "found"
+                        end if
+                    end repeat
+                end repeat
+            end repeat
+            return "not_found"
+        end tell
+        """
+        runUserAppleScript(named: "focus-iterm-tab", source: script)
+    }
+
     private func activateApp(named name: String) {
         let script = "tell application \"\(name)\" to activate"
-        if let appleScript = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            appleScript.executeAndReturnError(&error)
-        }
+        runUserAppleScript(named: "activate-app", source: script)
     }
 
     private func runProcess(_ path: String, args: [String]) -> String {
